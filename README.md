@@ -1,0 +1,1 @@
+This is a program to take communicate with both an ESP8266 on the local network over MQTT, and with DynamoDB.
