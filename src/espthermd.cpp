@@ -4,6 +4,12 @@
 #include <iostream>
 #include <chrono>
 #include <mosquittopp.h>
+#include <aws/core/Aws.h>
+#include <aws/core/utils/Outcome.h>
+#include <aws/dynamodb/DynamoDBClient.h>
+#include <aws/dynamodb/model/AttributeDefinition.h>
+#include <aws/dynamodb/model/PutItemRequest.h>
+#include <aws/dynamodb/model/PutItemResult.h>
 
 // #include <Aws.h>
 // #include </utils/Outcome.h> 
@@ -306,13 +312,67 @@ void yieldEspCPU(int x) {
   Serial.print(",");
 }
 
+//MQTT callback initializations
+void my_message_callback(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message)
+{
+	if(message->payloadlen){
+		printf("%s %s\n", message->topic, message->payload);
+	}else{
+		printf("%s (null)\n", message->topic);
+	}
+	fflush(stdout);
+}
+
+void my_connect_callback(struct mosquitto *mosq, void *userdata, int result)
+{
+	int i;
+	if(!result){
+		/* Subscribe to broker information topics on successful connect. */
+		mosquitto_subscribe(mosq, NULL, "$SYS/#", 2);
+		mosquitto_subscribe(mosq, NULL, "sensors/#", 1);
+	}else{
+		fprintf(stderr, "Connect failed\n");
+	}
+}
+
+void my_subscribe_callback(struct mosquitto *mosq, void *userdata, int mid, int qos_count, const int *granted_qos)
+{
+	int i;
+  if(!strcmp(mid->topic,"sensors/esp1/temp"))
+  {
+    PlaceSingleTemp();
+  }
+
+	printf("Subscribed (mid: %d): %d", mid, granted_qos[0]);
+	for(i=1; i<qos_count; i++){
+		printf(", %d", granted_qos[i]);
+	}
+	printf("\n");
+}
+
+void my_log_callback(struct mosquitto *mosq, void *userdata, int level, const char *str)
+{
+	/* Pring all log messages regardless of level. */
+	printf("%s\n", str);
+}
+
+//End of MQTT callback section
+
 const int NUM_SECONDS = 10;
 
 void loop() {
-  //Increment program loop timer
-  using std::chrono::steady_clock; 
+  // Setup AWS config
+  Aws::SDKOptions options;
+  Aws::InitAPI(options);
 
-  int mosquitto_
+  Aws::Client::ClientConfiguration clientConfig;
+  Aws::DynamoDB::DynamoDBClient dynamoClient(clientConfig);
+
+  Aws::DynamoDB::Model::GetItemRequest req;
+
+  //Increment program loop timer
+  using std::chrono::steady_clock;
+
   auto epoch = steady_clock::now();
   
 	    if (!epoch_initial) {
@@ -329,7 +389,30 @@ void loop() {
 
     epoch_now = epoch;
 
-  
+    // Set up MQTT daemon and subscribe to topic
+    // Mosquitto variables
+    int i;
+  	char *host = "localhost";
+  	int port = 1883;
+  	int keepalive = 60;
+  	bool clean_session = true;
+    struct mosquitto *mosq = NULL;
+
+    mosquitto_lib_init();
+    mosq = mosquitto_new(NULL, clean_session, NULL);
+	  if(!mosq){
+		  fprintf(stderr, "Error: Out of memory.\n");
+    }
+    mosquitto_log_callback_set(mosq, my_log_callback);
+	  mosquitto_connect_callback_set(mosq, my_connect_callback);
+  	mosquitto_message_callback_set(mosq, my_message_callback);
+    mosquitto_subscribe_callback_set(mosq, my_subscribe_callback);
+
+    if(mosquitto_connect(mosq, host, port, keepalive)){
+      fprintf(stderr, "Unable to connect to MQTT.\n")
+    }
+
+    
   //Temperature then output update loop, executes every 20 sec 
   if ( epoch_now - lastTempOutputUpdate > 20000 ) {
     Serial.println();
@@ -402,71 +485,16 @@ void printMemory() {
   Serial.println();
 }
 
-uint32_t getTheTime() { // Get the NTP time for averaging over the longer intervals - code largely similar to Arduino NTP example
-  //Initial delay to wait for NTP time server response
-  unsigned long tempoffset = millis();
-  delay(1000);
-  
-  if (udp.parsePacket() == 0) {
-    return 0;
-  }
-  
-  //Initializing the AWS offset for AWS packet time purposes
-  awsoffset = tempoffset; 
+void PlaceSingleTemp() {
 
-  udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
+  Aws::DynamoDB::Model::PutItemRequest pir;
+  pir.SetTableName(TABLE_NAME1);
 
-  Serial.print("TD22, ");
-  
-  unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-  unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-  // combine the four bytes (two words) into a long integer
-  // this is NTP time (seconds since Jan 1 1900):
-  unsigned long secsSince1900 = highWord << 16 | lowWord;
-  
-  Serial.print("TD23, ");
+  Aws::DynamoDB::Model::AttributeValue av;
+  av.setS(name);
+  pir.AddItem("Name", av);
 
-  // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
-  const unsigned long seventyYears = 2208988800UL;
-  // subtract seventy years for Unix time:
-  unsigned long UNIXTime = secsSince1900 - seventyYears;
-  return UNIXTime;
-}
 
-// send an NTP request to the time server at the given address - also largely from Arduino NTP example
-void sendNTPpacket(IPAddress& address) {
-
-    Serial.print("TD25, ");
-  
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  // Initialize values needed to form NTP request
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49;
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
-
-    Serial.print("TD26, ");
-
-  // all NTP fields have been given values, now
-  // you can send a packet requesting a timestamp:
-  udp.beginPacket(address, 123); //NTP requests are to port 123
-
-    Serial.print("TD27, ");
-  
-  //I've been getting a good amount of controller resets (watchdog timer and otherwise) at this step, need more investigation
-  udp.write(packetBuffer, NTP_PACKET_SIZE);
-
-    Serial.print("TD28, ");
-
-  udp.endPacket();
-  yield();
-
-    Serial.print("TD29, ");
 }
 
 void gettemperature() {

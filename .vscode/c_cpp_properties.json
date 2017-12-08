@@ -54,9 +54,9 @@
                 "C:/MinGW/lib/gcc/mingw32/6.3.0/include",
                 "C:/MinGW/include",
                 "C:/MinGW/lib/gcc/mingw32/6.3.0/include-fixed",
-                "C:/AWS/aws-sdk-cpp-master/aws-cpp-sdk-core/include/aws/core",
-                "C:/AWS/aws-sdk-cpp-master/aws-cpp-sdk-core/include/aws/core/utils",
-                "C:/AWS/aws-sdk-cpp-master/aws-cpp-sdk-core/include/aws/core/utils/logging",
+                "C:/AWS/aws-sdk-cpp-master/aws-cpp-sdk-core/include/",
+                "C:/AWS/aws-sdk-cpp-master/aws-cpp-sdk-dynamodb/include/",
+                "C:/Users/cbenton/Documents/mosquitto-master/mosquitto-master/lib", 
                 "C:/Users/cbenton/Documents/mosquitto-master/mosquitto-master/lib/cpp"
             ],
             "defines": [
@@ -71,6 +71,7 @@
                     "${workspaceRoot}",
                     "C:/MinGW/lib/gcc/mingw32/6.3.0/include",
                     "C:/MinGW/lib/gcc/mingw32/6.3.0/include/fixed",
+                    "C:/Users/cbenton/Documents/mosquitto-master/mosquitto-master/lib", 
                     "C:/AWS/aws-sdk-cpp-master/"
                 ],
                 "limitSymbolsToIncludedHeaders": true,
