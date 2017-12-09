@@ -315,6 +315,13 @@ void yieldEspCPU(int x) {
 //MQTT callback initializations
 void my_message_callback(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message)
 {
+
+  if(!strcmp(message->topic,"sensors/esp1/temp"))
+  {
+
+    PlaceSingleTemp();
+  }
+
 	if(message->payloadlen){
 		printf("%s %s\n", message->topic, message->payload);
 	}else{
@@ -338,10 +345,6 @@ void my_connect_callback(struct mosquitto *mosq, void *userdata, int result)
 void my_subscribe_callback(struct mosquitto *mosq, void *userdata, int mid, int qos_count, const int *granted_qos)
 {
 	int i;
-  if(!strcmp(mid->topic,"sensors/esp1/temp"))
-  {
-    PlaceSingleTemp();
-  }
 
 	printf("Subscribed (mid: %d): %d", mid, granted_qos[0]);
 	for(i=1; i<qos_count; i++){
@@ -485,10 +488,13 @@ void printMemory() {
   Serial.println();
 }
 
-void PlaceSingleTemp() {
+void PlaceSingleTemp(int argc, char** argv) {
+
+  const Aws::String table(argv[1]);
+  const Aws::String name(argv[2]);
 
   Aws::DynamoDB::Model::PutItemRequest pir;
-  pir.SetTableName(TABLE_NAME1);
+  pir.SetTableName(table);
 
   Aws::DynamoDB::Model::AttributeValue av;
   av.setS(name);
