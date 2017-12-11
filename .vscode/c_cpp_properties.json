@@ -69,11 +69,10 @@
             "browse": {
                 "path": [
                     "${workspaceRoot}",
-                    "C:/Program Files (x86)/Windows Kits/10/Include",
-                    "C:/Program Files (x86)/Microsoft Visual Studio/2017/Community/SDK",
-                    "C:/Users/conno_000/libs/mosquitto-master/lib",
-                    "C:/Users/conno_000/libs/aws-sdk-cpp-master/aws-cpp-sdk-core/include/",
-                    "C:/Users/conno_000/libs/aws-sdk-cpp-master/aws-cpp-sdk-dynamodb/include/"
+                    "C:/MinGW/lib/gcc/mingw32/6.3.0/include",
+                    "C:/Users/cbenton/Documents/mosquitto-master/mosquitto-master/lib", 
+                    "C:/AWS/aws-sdk-cpp-master/aws-cpp-sdk-core/include/",
+                    "C:/AWS/aws-sdk-cpp-master/aws-cpp-sdk-dynamodb/include/"
                 ],
                 "limitSymbolsToIncludedHeaders": true,
                 "databaseFilename": ""
