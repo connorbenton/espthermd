@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <iostream>
 #include <chrono>
+#include <cstring>
+#include <string>
 #include <mosquittopp.h>
 #include <aws/core/Aws.h>
 #include <aws/core/utils/Outcome.h>
@@ -316,10 +318,23 @@ void yieldEspCPU(int x) {
 void my_message_callback(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message)
 {
 
-  if(!strcmp(message->topic,"sensors/esp1/temp"))
+  if(!strcmp(message->topic,"sensors/+/temp"))
   {
+    vector <string> uploadData;
 
-    PlaceSingleTemp();
+    uploadData.push_back("Date:" + epoch);
+    uploadData.push_back("pidOutput:" + currentpid);
+    // should I push the heaterState from the ESP or from the Pi? Leaning towards the ESP for now
+
+    char * ESPBuf = std::strtok (message->payload,",");
+    while (ESPBuf!=0)
+    {
+      uploadData.push_back(ESPBuf);
+      ESPBuf = std::strtok(NULL,",")
+    }
+
+    DynamoPlaceTemp(TABLE_NAME1, uploadData);
+    StoreTemp(uploadData);
   }
 
 	if(message->payloadlen){
@@ -363,7 +378,7 @@ void my_log_callback(struct mosquitto *mosq, void *userdata, int level, const ch
 
 const int NUM_SECONDS = 10;
 
-void loop() {
+void initialize() {
   // Setup AWS config
   Aws::SDKOptions options;
   Aws::InitAPI(options);
@@ -373,7 +388,7 @@ void loop() {
 
   Aws::DynamoDB::Model::GetItemRequest req;
 
-  //Increment program loop timer
+  //Initialize timer for program
   using std::chrono::steady_clock;
 
   auto epoch = steady_clock::now();
@@ -488,18 +503,46 @@ void printMemory() {
   Serial.println();
 }
 
-void PlaceSingleTemp(int argc, char** argv) {
+void DynamoPlaceTemp(const char* table_name, vector <string> argv) {
 
-  const Aws::String table(argv[1]);
+  const Aws::String table(table_name);
   const Aws::String name(argv[2]);
 
   Aws::DynamoDB::Model::PutItemRequest pir;
   pir.SetTableName(table);
 
-  Aws::DynamoDB::Model::AttributeValue av;
-  av.setS(name);
-  pir.AddItem("Name", av);
+  for (int x = 0; x < argv.size(); x++)
+  {
+    const Aws::String arg(argv[x]);
+    const Aws::Vector<Aws::String>& flds = Aws::Utils::StringUtils::Split(arg, ':');
+    if (flds.size() == 3)
+    {
+      if (flds[2] == "N")
+      {
+        Aws::DynamoDB::Model::AttributeValue val;
+        val.SetN(flds[1]);
+        pir.AddItem(flds[0], val);
+      } else if (flds[2] == "S") {
+        Aws::DynamoDB::Model::AttributeValue val;
+        val.SetS(flds[1]);
+        pir.AddItem(flds[0], val);
+      } else {
+        std::cout << "Invalid variable type: " << flds[2] << std::endl << USAGE;
+      }
+    }
+    else
+    {
+        std::cout << "Invalid argument: " << arg << std::endl << USAGE;
+    }
+  }
 
+  const Aws::DynamoDB::Model::PutItemOutcome result = dynamoClient.PutItem(pir);
+    if (!result.IsSuccess())
+    {
+        std::cout << result.GetError().GetMessage() << std::endl;
+        return 1;
+    }
+    std::cout << "PlaceTemp Done!" << std::endl;
 
 }
 
