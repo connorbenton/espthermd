@@ -5,7 +5,11 @@
 #include <chrono>
 #include <cstring>
 #include <string>
+
 #include <mosquittopp.h>
+
+#include <PID_v1.h>
+
 #include <aws/core/Aws.h>
 #include <aws/core/utils/Outcome.h>
 #include <aws/dynamodb/DynamoDBClient.h>
@@ -49,14 +53,14 @@ void printMemory();
 // We use byte array as an example.
 struct {
   uint32_t crc32;
-  float t5;
-  float t90;
-  float u5;
-  float u90;
-  float p5;
-  float p90;
-  float h5;
-  float h90;
+  double t5;
+  double t90;
+  double u5;
+  double u90;
+  double p5;
+  double p90;
+  double h5;
+  double h90;
   int c5;
   int c90;
   unsigned long initial;
@@ -74,17 +78,26 @@ double pidOutput = 0;
 //Setting to store transistor state
 int transistorGate;
 
-//This section of floats and counter ints stores the current and running data for the data that will be outputted to DynamoDB 
-float temp_f_sum_20s, temp_f_sum_5m, temp_f_sum_90m = 0;
-float humidity_sum_20s, humidity_sum_5m, humidity_sum_90m = 0;
-float pid_sum_20s, pid_sum_5m, pid_sum_90m = 0;
-float heater_sum_20s, heater_sum_5m, heater_sum_90m = 0;
+//This section of doubles and double vectors stores the current and running data for the data that will be outputted to DynamoDB 
 
-float temp_f_inst_5m, humidity_inst_5m, pid_inst_5m, heater_inst_5m = 0;
-float temp_f_inst_90m, humidity_inst_90m, pid_inst_90m, heater_inst_90m = 0;
-float temp_f_inst_1d, humidity_inst_1d, pid_inst_1d, heater_inst_1d = 0;
+std::vector <double> temp_f_20s;
+std::vector <double> humidity_20s;
+std::vector <double> pid_20s;
+std::vector <double> heater_20s;
 
-float heater_now;
+std::vector <double> temp_f_5m;
+std::vector <double> humidity_5m;
+std::vector <double> pid_5m;
+std::vector <double> heater_5m;
+
+std::vector <double> temp_f_90m;
+std::vector <double> humidity_90m;
+std::vector <double> pid_90m;
+std::vector <double> heater_90m;
+
+double temp_f_inst_1d, humidity_inst_1d, pid_inst_1d, heater_inst_1d = 0;
+
+double heater_now;
 
 int counter_20s = 0;
 int counter_5m = 0;
@@ -102,7 +115,7 @@ bool flagDontPushAvgTemp = false;
 double KP = 25;
 double KI = 0.028;
 double KD = 0;   // Not yet used
-unsigned long windowSize = 1800000; // 30 minutes (ish)
+unsigned long windowSize = 1800; // 30 minutes (ish)
 
 //Variable to keep track of PID window
 unsigned long windowStartTime = 0;
@@ -115,27 +128,12 @@ const char* AWS_REGION = "us-west-1";
 const char* AWS_ENDPOINT = "amazonaws.com";
 
 // Constants describing DynamoDB table and values being used
-const char* TABLE_NAME1 = "Temperatures_20_sec";
-const char* HASH_KEY_NAME1 = "Id";
-const char* HASH_KEY_VALUE1 = "Thermostat_01"; // My sensor ID
-const char* RANGE_KEY_NAME1 = "Date";
+const char* TABLE_20S = "Temperatures_20_sec";
+const char* TABLE_5M = "Temperatures_5_min";
+const char* TABLE_90M = "Temperatures_90_min";
+const char* TABLE_1D = "Temperatures_1_day";
 
-const char* TABLE_NAME3 = "Temperatures_5_min";
-const char* HASH_KEY_NAME3 = "Id";
-const char* HASH_KEY_VALUE3 = "Thermostat_01";
-const char* RANGE_KEY_NAME3 = "Date";
-
-const char* TABLE_NAME4 = "Temperatures_90_min";
-const char* HASH_KEY_NAME4 = "Id";
-const char* HASH_KEY_VALUE4 = "Thermostat_01";
-const char* RANGE_KEY_NAME4 = "Date";
-
-const char* TABLE_NAME5 = "Temperatures_1_day";
-const char* HASH_KEY_NAME5 = "Id";
-const char* HASH_KEY_VALUE5 = "Thermostat_01";
-const char* RANGE_KEY_NAME5 = "Date";
-
-const char* TABLE_NAME2 = "HeaterManualState";
+const char* TABLE_STATE = "HeaterManualState";
 const char* HASH_KEY_NAME2 = "Id";
 const char* HASH_KEY_VALUE2 = "Website";
 const char* RANGE_KEY_VALUE2 = "1";
@@ -143,7 +141,7 @@ const char* RANGE_KEY_NAME2 = "Date";
 static const int KEY_SIZE = 2;
 
 //Variable to internally track the heater state of the website
-static int WebsiteHeaterState;
+static int HeaterControl;
 
 //DynamoDB objects
 Esp8266HttpClient httpClient;
@@ -170,7 +168,7 @@ double humidity, temp_f = 0;
 PID myPID(&temp_f, &pidOutput, &setPoint, KP, KI, KD, DIRECT);
 
 //Loop and AWS offset time variables 
-unsigned long lastTimeUpdate, lastTempOutputUpdate, lastHeaterRefresh, awsoffset = 0;
+unsigned long lastTimeUpdate, lastTempOutputUpdate, lastHeaterRefresh = 0;
 
 //Setup section
 void setup()
@@ -322,19 +320,16 @@ void my_message_callback(struct mosquitto *mosq, void *userdata, const struct mo
   {
     vector <string> uploadData;
 
-    uploadData.push_back("Date:" + epoch);
-    uploadData.push_back("pidOutput:" + currentpid);
-    // should I push the heaterState from the ESP or from the Pi? Leaning towards the ESP for now
 
-    char * ESPBuf = std::strtok (message->payload,",");
+    char * ESPBuf = std::strtok(message->payload,",");
     while (ESPBuf!=0)
     {
       uploadData.push_back(ESPBuf);
       ESPBuf = std::strtok(NULL,",")
     }
 
-    DynamoPlaceTemp(TABLE_NAME1, uploadData);
-    StoreTemp(uploadData);
+    ProcessTemp(uploadData);
+
   }
 
 	if(message->payloadlen){
@@ -389,9 +384,8 @@ void initialize() {
   Aws::DynamoDB::Model::GetItemRequest req;
 
   //Initialize timer for program
-  using std::chrono::steady_clock;
 
-  auto epoch = steady_clock::now();
+  epoch = std::chrono::system_clock::now();
   
 	    if (!epoch_initial) {
 	    epoch_initial = epoch;
@@ -503,17 +497,17 @@ void printMemory() {
   Serial.println();
 }
 
-void DynamoPlaceTemp(const char* table_name, vector <string> argv) {
+void DynamoPlaceTemp(const char* table_name, vector <string> outputData) {
 
   const Aws::String table(table_name);
-  const Aws::String name(argv[2]);
+  const Aws::String name(outputData[2]);
 
   Aws::DynamoDB::Model::PutItemRequest pir;
   pir.SetTableName(table);
 
-  for (int x = 0; x < argv.size(); x++)
+  for (int x = 0; x < outputData.size(); x++)
   {
-    const Aws::String arg(argv[x]);
+    const Aws::String arg(outputData[x]);
     const Aws::Vector<Aws::String>& flds = Aws::Utils::StringUtils::Split(arg, ':');
     if (flds.size() == 3)
     {
@@ -546,70 +540,9 @@ void DynamoPlaceTemp(const char* table_name, vector <string> argv) {
 
 }
 
-void gettemperature() {
-
-  Serial.print("TE 41, ");
-  
-  // Reading temperature for humidity takes about 250 milliseconds
-  // Sensor readings may also be up to 2 seconds 'old' (it's a very slow sensor)
-  humidity = dht.readHumidity();          // Read humidity (percent)
-  temp_f = dht.readTemperature(true);     // Read temperature as Farenheight
-
-  Serial.print("TE 42, ");
-
-  // Check if any reads failed
-  if (isnan(humidity) || isnan(temp_f)) {
-    //If reads failed try to re-read sensor
-    byte hu;
-    for (hu = 0; hu < 30; hu++)
-    {
-      temp_f = dht.readTemperature(true);
-      if isnan(temp_f) {
-
-        Serial.print("TE 43, ");
-	
-        delay(150);
-        temp_f = dht.readTemperature(true);
-      }
-    }
-    return;
-  }
-
-  Serial.print("TE 44, ");
-
-  //Get and set the current website heater state
-  awsGetWebsiteHeaterState(&WebsiteHeaterState);
-  yield();
-  
-  // Handling for various times and averages
-  if (stateVariable)
-  {
-      heater_now = 100.00;
-  }
-  else
-  {
-      heater_now = 0.00;
-  }
-
-  Serial.print("TE 45, ");
-
-  //Push 20sec data to DyanmoDB
-  PushTempToDynamoDB(temp_f, humidity, pidOutput, heater_now, TABLE_NAME1, HASH_KEY_NAME1, HASH_KEY_VALUE1, RANGE_KEY_NAME1);
-  yield();
-  
-  Serial.print("TE 46, ");
-  
-  //Adding cumulatively the values of the 20sec measurements
-  temp_f_sum_20s = temp_f_sum_20s + temp_f;
-  humidity_sum_20s = humidity_sum_20s + humidity;
-  pid_sum_20s = pid_sum_20s + pidOutput;
-  heater_sum_20s = heater_sum_20s + heater_now;
-  
-  //Incrementing 20sec measurement instance counter
-  counter_20s++;
-
-  Serial.print("TE 47, ");
-
+void TimeLog(std::string calledby) {
+  Serial.print("TimeLog ")
+  Serial.print(calledby)
   Serial.print("Epoch now: ");
     Serial.print(epoch_now);
   Serial.print(" Epoch last 5m: ");
@@ -618,31 +551,110 @@ void gettemperature() {
     Serial.print(epoch_last_90m);
   Serial.print(" Epoch last 1d: ");
     Serial.print(epoch_last_1d);
+} 
+
+void ProcessTemp(vector <string> outputData) {
+
+  std::vector<int>::iterator it;
+
+  // extract humidity data from ESP MQTT msg
+  it = std::find(outputData.begin(), outputData.end(), "humidity") 
+  if (it != outputData.end())   
+  {
+    std::vector<string> flds;
+    char * pch;
+    pch = strtok(it, ":")
+    while (pch != NULL)
+    {
+      flds.push_back(pch)
+      pch = strtok (NULL, ":")
+    }
+    humidity = atof (flds[1]);
+  }
+  else
+    cout << "Humidity value not found in message"
+
+  // extract temperature data from ESP MQTT msg
+  it = std::find(outputData.begin(), outputData.end(), "temp") 
+  if (it != outputData.end())   
+  {
+    std::vector<string> flds;
+    char * pch;
+    pch = strtok(it, ":")
+    while (pch != NULL)
+    {
+      flds.push_back(pch)
+      pch = strtok (NULL, ":")
+    }
+    temp_f = atof (flds[1]);
+  }
+  else
+    cout << "Temperature value not found in message"
+  
+  // extract heater data from ESP MQTT msg
+  it = std::find(outputData.begin(), outputData.end(), "heaterState") 
+  if (it != outputData.end())   
+  {
+    std::vector<string> flds;
+    char * pch;
+    pch = strtok(it, ":")
+    while (pch != NULL)
+    {
+      flds.push_back(pch)
+      pch = strtok (NULL, ":")
+    }
+    heaterState = atof (flds[1]);
+    if (heaterState > 50)
+      stateVariable = true;
+    else 
+      stateVariable = false;
+  }
+  else
+    cout << "Heater value not found in message"
+
+  // get the data supplied by the Pi for upload here - first get the current time and convert it to Amazon format
+  epoch = std::chrono::system_clock::now();
+  time_t awstime = epoch; 
+  sprintf(awstimestr, "%04d%02d%02d%02d%02d%02d", year(awstime), month(awstime), day(awstime), hour(awstime), minute(awstime), second(awstime));
+  uploadData.push_back("Date:" + awstimestr + ":N"); 
+
+  // now get the current PID output
+  updateOutput();
+  uploadData.push_back("pidOutput:" + pidOutput ":N");
+
+  //Push 20sec data to DyanmoDB
+  DynamoPlaceTemp(TABLE_20S, uploadData);
+  
+  //Store 20sec data in vectors
+  temp_f_20s.push_back(temp_f);
+  humidity_20s.push_back(humidity);
+  pid_20s.push_back(pidOutput);
+  heater_20s.push_back(heaterState);
+
+  TimeLog("After 20s data stored in vectors: ");
 
   //Handling once NTP time has passed 5min
   if (epoch_now - epoch_last_5m > 300) { 
 
-      Serial.print("TE 48, ");
+    Serial.print("TE 48, ");
 
-      //Averaging 20sec measurements and setting them to a 5min variable
-      temp_f_inst_5m = temp_f_sum_20s / counter_20s;
-      humidity_inst_5m = humidity_sum_20s / counter_20s; 
-      pid_inst_5m = pid_sum_20s / counter_20s;
-      heater_inst_5m = heater_sum_20s / counter_20s;
+    //Averaging 20sec measurements and setting them to a 5min variable
+    double temp_f_inst_5m = accumulate( temp_f_20s.begin(), temp_f_20s.end(), 0.0)/temp_f_20s.size();
+    double humidity_inst_5m = accumulate( humidity_20s.begin(), humidity_20s.end(), 0.0)/humidity_20s.size(); 
+    double pid_inst_5m = accumulate( pid_20s.begin(), pid_20s.end(), 0.0)/pid_20s.size();
+    double heater_inst_5m = accumulate( heater_20s.begin(), heater_20s.end(), 0.0)/heater_20s.size();
 
-      //Resetting 20sec sums
-      temp_f_sum_20s = 0;
-      humidity_sum_20s = 0;
-      pid_sum_20s = 0;
-      heater_sum_20s = 0;
-    
-      //Resetting 20sec measurement instance counter
-      counter_20s = 0;
+    //store 5min data in vectors
+    temp_f_5m.push_back(temp_f_inst_5m);
+    humidity_5m.push_back(humidity_inst_5m);
+    pid_5m.push_back(pid_inst_5m);
+    heater_5m.push_back(heater_inst_5m);
 
-      Serial.print("TE 49, ");
-      
-      //Incrementing 5min measurement instance counter
-      counter_5m++;
+    //Resetting 20sec vectors
+    temp_f_20s.swap(std::vector<double>());
+    humidity_20s.swap(std::vector<double>());
+    pid_20s.swap(std::vector<double>());
+    heater_20s.swap(std::vector<double>()); 
 
 	  //Writing values to RTC memory in case of crash
 	  RTCMemWrite();
@@ -894,7 +906,7 @@ void gettemperature() {
 
 }
 
-void getWebsiteHeaterState(int *WebsiteHeaterState, GetItemOutput getItemOutput) {
+void getHeaterControl(int *HeaterControl, GetItemOutput getItemOutput) {
   char szC[6];
 
   Serial.print("TE 7, ");
@@ -905,13 +917,13 @@ void getWebsiteHeaterState(int *WebsiteHeaterState, GetItemOutput getItemOutput)
 
   Serial.print("TE 8, ");
       
-  attributeMap.get("WebsiteHeaterState", av);
-  *WebsiteHeaterState = atoi(av.getS().getCStr());
+  attributeMap.get("HeaterControl", av);
+  *HeaterControl = atoi(av.getS().getCStr());
 
   delay(10);
 }
 
-void awsGetWebsiteHeaterState(int *WebsiteHeaterState) {
+void awsGetHeaterControl(int *HeaterControl) {
 
   Serial.print("TE 31, ");
 
@@ -927,7 +939,7 @@ void awsGetWebsiteHeaterState(int *WebsiteHeaterState) {
   MinimalKeyValuePair<MinimalString, AttributeValue> keyArray[] = { pair1, pair2 };
   getItemInput.setKey(MinimalMap < AttributeValue > (keyArray, KEY_SIZE));
   
-  MinimalString attributesToGet[] = { "WebsiteHeaterState" };
+  MinimalString attributesToGet[] = { "HeaterControl" };
   getItemInput.setAttributesToGet(MinimalList < MinimalString > (attributesToGet, 1));
 
   // Set Table Name
@@ -946,7 +958,7 @@ void awsGetWebsiteHeaterState(int *WebsiteHeaterState) {
   Serial.print("TE 35, ");
     
     case NONE_ACTIONERROR:
-      getWebsiteHeaterState(WebsiteHeaterState, getItemOutput);
+      getHeaterControl(HeaterControl, getItemOutput);
       yield();
       break;
 
@@ -968,7 +980,7 @@ void awsGetWebsiteHeaterState(int *WebsiteHeaterState) {
   Serial.print("TE 36, ");
 }
 
-void PushTempToDynamoDB(float temp_f_update, float humidity_update, float pid_update, float heater_update, const char* T_N, const char* HK_N, const char* HK_V, const char* RK_N) {
+void PushTempToDynamoDB(double temp_f_update, double humidity_update, double pid_update, double heater_update, const char* T_N, const char* HK_N, const char* HK_V, const char* RK_N) {
 
   Serial.print("TE 37, ");
   
@@ -990,7 +1002,7 @@ void PushTempToDynamoDB(float temp_f_update, float humidity_update, float pid_up
      use setN to apply that value to the AttributeValue. */
 
   int d1 = temp_f_update;
-  float f2 = temp_f_update - d1;
+  double f2 = temp_f_update - d1;
   int d2 = f2 * 100 + 1;
 
   char numberBuffer[20];
@@ -1000,7 +1012,7 @@ void PushTempToDynamoDB(float temp_f_update, float humidity_update, float pid_up
 
   //AttributeValue for PID output
   int d3 = pid_update;
-  float f3 = pid_update - d3;
+  double f3 = pid_update - d3;
   int d4 = f3 * 100 + 1;
 
   char pidBuffer[20];
@@ -1010,7 +1022,7 @@ void PushTempToDynamoDB(float temp_f_update, float humidity_update, float pid_up
 
   //AttributeValue for heater output
   int d7 = heater_update;
-  float f5 = heater_update - d7;
+  double f5 = heater_update - d7;
   int d8 = f5 * 100 + 1;
 
   char heaterbuffer[20];
@@ -1020,7 +1032,7 @@ void PushTempToDynamoDB(float temp_f_update, float humidity_update, float pid_up
 
   //AttributeValue for humidity
   int d5 = humidity_update;
-  float f4 = humidity_update - d5;
+  double f4 = humidity_update - d5;
   int d6 = f4 * 100 + 1;
 
   char humidityBuffer[20];
@@ -1138,46 +1150,47 @@ void updateOutput() {
     myPID.Compute();
   }
 
+  //Set initial window start time on initial run
+  if (windowStartTime = 0)
+    windowStartTime = epoch;
+  
   //Shift the window once past 30min
-  if (now2 - windowStartTime > windowSize) {
+  if (difftime(epoch, windowStartTime) > windowSize) {
     windowStartTime += windowSize;
   }
 
   //Heater control updates based on setting state and PID output - you can see at the start that this was based on the RF switch/outlet system, given the 'Outlet' helper function names
-  if ((WebsiteHeaterState == 1) && (stateVariable))
+  if ((HeaterControl == 1) && (stateVariable))
   {
-    stateVariable = !stateVariable;
     Serial.println("Manual Control set to Off & Heater is On - Turning it Off");
     OffOutlet();
-    yield();
   }
-  else if ((WebsiteHeaterState == 3) && (!stateVariable))
+  else if ((HeaterControl == 3) && (!stateVariable))
   {
-    stateVariable = !stateVariable;
     Serial.println("Manual Control set to On & Heater is Off - Turning it On");
     OnOutlet();
-    yield();
   }
   //I need to investigate whether the thermostat will turn the heater back on during a cycle that it has already turned it off within - ideally, the heater should only come on at the beginning of the window - I could set an additional 'HasTurnedOff' bool if need be to fix this if it's an issue
-  else if ((WebsiteHeaterState == 2) && (pidOutput * windowSize > ((now2 - windowStartTime) * 100)) && (!stateVariable))
+  else if ((HeaterControl == 2) && (pidOutput * windowSize > ((epoch - windowStartTime) * 100)) && (!stateVariable))
   {
-    stateVariable = !stateVariable;
-    Serial.println("Automatic Control - Beginning of Window - Turning On");
+    Serial.println("Automatic Control - Turning On");
     OnOutlet();
-    yield();
   }
-  else if ((WebsiteHeaterState == 2) && (pidOutput * windowSize < ((now2 - windowStartTime) * 100)) && (stateVariable))
+  else if ((HeaterControl == 2) && (pidOutput * windowSize < ((epoch - windowStartTime) * 100)) && (stateVariable))
   {
-    stateVariable = !stateVariable;
     Serial.println("Automatic Control - Turning Off");
     OffOutlet();
-    yield();
   }
 }
 
 
 //Flash LED and turn heater on - transistor setting read before and after setting it for debugging purposes
 void OnOutlet() {
+  // if (check)
+  // {
+  //   Serial.println("Heater is already on; no need to turn it on. Exiting OnOutlet.")
+  //   return;
+  // }
   digitalWrite(LED_BUILTIN, LOW);
   delay(100);
   transistorGate = digitalRead(14);
@@ -1192,6 +1205,7 @@ void OnOutlet() {
   delay(500);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.println("Turning On Heater!");
+  stateVariable = true;
   //Currently not using the RF switch functionality
   //  mySwitch.send("000101010001110100000011");
   //  delay(500);
@@ -1205,6 +1219,11 @@ void OnOutlet() {
 
 //Flash LED and turn heater off - transistor setting read before and after setting it for debugging purposes
 void OffOutlet() {
+  // if (!check)
+  // {
+  //   Serial.println("Heater is already off; no need to turn it off. Exiting OffOutlet.")
+  //   return;
+  // }
   digitalWrite(LED_BUILTIN, LOW);
   delay(100);
   transistorGate = digitalRead(14);
@@ -1219,6 +1238,7 @@ void OffOutlet() {
   delay(500);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.println("Turning Off Heater!"); //
+  stateVariable = false;
   //Currently not using the RF switch functionality
   //  digitalWrite(LED_BUILTIN, LOW);
   //  mySwitch.send("000101010001110100001100");
