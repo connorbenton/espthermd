@@ -10,6 +10,7 @@
 
 #include <PID_v1.h>
 
+//Still need to figure out what to do when an internet connection is not available, even if the router is still on
 #include <aws/core/Aws.h>
 #include <aws/core/utils/Outcome.h>
 #include <aws/dynamodb/DynamoDBClient.h>
@@ -71,19 +72,13 @@ struct {
 //Initializing transistor pins
 int transistorPin = 14;
 int incomingByte;  // a variable to read incoming serial data into
-//Setpoint hardcoded, will switch to a GetItem from DynamoDB in the future
-double setPoint = 69.0;
-//Intializing the PID output, to avoid errors on the first PID run
-double pidOutput = 0;
+
+
 //Setting to store transistor state
 int transistorGate;
 
-//This section of doubles and double vectors stores the current and running data for the data that will be outputted to DynamoDB 
-
-std::vector <double> temp_f_20s;
-std::vector <double> humidity_20s;
-std::vector <double> pid_20s;
-std::vector <double> heater_20s;
+//Setting to store heater state as reported by ESP
+bool espState;
 
 std::vector <double> temp_f_5m;
 std::vector <double> humidity_5m;
@@ -105,40 +100,18 @@ int counter_90m = 0;
 
 WiFiUDP udp;
 
-//Variables to keep track of current and past upload time (format is seconds since last unix epoch)
-unsigned long epoch, epoch_initial, epoch_now, epoch_last_5m, epoch_last_90m, epoch_last_1d;
+
 
 //Currently not in use, this is a setting that should trip and stop average uploads if too many lower level time periods have passed (i.e. if the 5min average has taken 100 measurements of 20sec apiece)
 bool flagDontPushAvgTemp = false; 
 
-// PID tuning variables 
-double KP = 25;
-double KI = 0.028;
-double KD = 0;   // Not yet used
-unsigned long windowSize = 1800; // 30 minutes (ish)
 
-//Variable to keep track of PID window
-unsigned long windowStartTime = 0;
-
-//Variable to keep track of heater on or off state
-boolean stateVariable = false;
 
 //AWS constants
 const char* AWS_REGION = "us-west-1";
 const char* AWS_ENDPOINT = "amazonaws.com";
 
-// Constants describing DynamoDB table and values being used
-const char* TABLE_20S = "Temperatures_20_sec";
-const char* TABLE_5M = "Temperatures_5_min";
-const char* TABLE_90M = "Temperatures_90_min";
-const char* TABLE_1D = "Temperatures_1_day";
 
-const char* TABLE_STATE = "HeaterManualState";
-const char* HASH_KEY_NAME2 = "Id";
-const char* HASH_KEY_VALUE2 = "Website";
-const char* RANGE_KEY_VALUE2 = "1";
-const char* RANGE_KEY_NAME2 = "Date";
-static const int KEY_SIZE = 2;
 
 //Variable to internally track the heater state of the website
 static int HeaterControl;
@@ -162,10 +135,8 @@ RCSwitch mySwitch = RCSwitch();
 
 //Temperature sensor variables
 DHT dht(5, DHT22, 20);
-double humidity, temp_f = 0;
 
-//PID variable initial setting
-PID myPID(&temp_f, &pidOutput, &setPoint, KP, KI, KD, DIRECT);
+
 
 //Loop and AWS offset time variables 
 unsigned long lastTimeUpdate, lastTempOutputUpdate, lastHeaterRefresh = 0;
@@ -312,23 +283,64 @@ void yieldEspCPU(int x) {
   Serial.print(",");
 }
 
+int findThermostat(vector<Thermostat*> &vals, string name_in)
+{
+  if(vals.size() == 0)
+    return -1;
+  for (int i = 0; i < vals.size(); i++){
+    if (vals[i].thermoId == name_in)
+      return i;
+  }
+}
+
 //MQTT callback initializations
 void my_message_callback(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message)
 {
 
   if(!strcmp(message->topic,"sensors/+/temp"))
   {
-    vector <string> uploadData;
+    //Initialize string vector to store message data
+    std::vector<string> espData;
 
-
+    //Read message data into string vector
     char * ESPBuf = std::strtok(message->payload,",");
     while (ESPBuf!=0)
     {
-      uploadData.push_back(ESPBuf);
+      espData.push_back(ESPBuf);
       ESPBuf = std::strtok(NULL,",")
     }
 
-    ProcessTemp(uploadData);
+    //Extract ID of the sending sensor
+    std::string msgthermoId = extractDataStr(espData, "Id");
+
+    //Vector to store all possible thermostats, so they can be checked
+    static std::vector<Thermostat*> allThermos;
+    
+    //If vector has no items, automatically create the first new class member and process temp
+    if(allThermos.size() == 0){
+      thermo = new Thermostat(msgthermoId);
+      thermo.ProcessTemp(espData);
+      allThermos.push_back(thermo);
+    }
+
+    //Check if the thermo member already exists; if it does, process temp
+    bool createnewThermoflag = true;
+    for (int i = 0; i < allThermos.size(); i++){
+      if(allThermos[i].thermoId == msgthermoId){
+        allThermos[i].ProcessTemp(espData);
+        createnewThermoflag = false;
+        break;
+      }
+    }
+    //If it doesn't, create a new thermo member then process temp
+    if (createnewThermoflag){
+      thermo = new Thermostat(msgthermoId);
+      thermo.ProcessTemp(espData);
+      allThermos.push_back(thermo);
+    }
+
+    //Clear message data vector
+    espData.swap(std::vector<string>());
 
   }
 
@@ -385,22 +397,6 @@ void initialize() {
 
   //Initialize timer for program
 
-  epoch = std::chrono::system_clock::now();
-  
-	    if (!epoch_initial) {
-	    epoch_initial = epoch;
-	    epoch_last_5m = epoch;
-	    epoch_last_90m = epoch;
-	    epoch_last_1d = epoch;
-	    } 
-
-	  if (!epoch_last_5m) {
-	    //Just in case RTC memory loads a update time for 90m/1d that would be sooner than the 5m
-	      epoch_last_5m = epoch;
-	  }
-
-    epoch_now = epoch;
-
     // Set up MQTT daemon and subscribe to topic
     // Mosquitto variables
     int i;
@@ -424,25 +420,6 @@ void initialize() {
       fprintf(stderr, "Unable to connect to MQTT.\n")
     }
 
-    
-  //Temperature then output update loop, executes every 20 sec 
-  if ( epoch_now - lastTempOutputUpdate > 20000 ) {
-    Serial.println();
-    Serial.print("Get Temp-");
-    Serial.println();
-    gettemperature();
-    yield();
-    Serial.println();
-    Serial.println("Temp Successful");
-    Serial.println();
-    Serial.print("Update Output-");
-    updateOutput();
-    yield();
-    Serial.println("Successful");
-    Serial.println();
-    lastTempOutputUpdate = epoch_now;
-  }
-  
 }
 
 //Checksum function to validate RTC data
@@ -497,17 +474,17 @@ void printMemory() {
   Serial.println();
 }
 
-void DynamoPlaceTemp(const char* table_name, vector <string> outputData) {
+void DynamoPlaceTemp(const char* table_name, vector <string> uploadData) {
 
   const Aws::String table(table_name);
-  const Aws::String name(outputData[2]);
+  const Aws::String name(uploadData[2]);
 
   Aws::DynamoDB::Model::PutItemRequest pir;
   pir.SetTableName(table);
 
-  for (int x = 0; x < outputData.size(); x++)
+  for (int x = 0; x < uploadData.size(); x++)
   {
-    const Aws::String arg(outputData[x]);
+    const Aws::String arg(uploadData[x]);
     const Aws::Vector<Aws::String>& flds = Aws::Utils::StringUtils::Split(arg, ':');
     if (flds.size() == 3)
     {
@@ -540,11 +517,11 @@ void DynamoPlaceTemp(const char* table_name, vector <string> outputData) {
 
 }
 
-void TimeLog(std::string calledby) {
+void TimeLog(std::string calledby, long epoch, long epoch_last_5m, long epoch_last_90m, long epoch_last_1d) {
   Serial.print("TimeLog ")
   Serial.print(calledby)
   Serial.print("Epoch now: ");
-    Serial.print(epoch_now);
+    Serial.print(epoch);
   Serial.print(" Epoch last 5m: ");
     Serial.print(epoch_last_5m);
   Serial.print(" Epoch last 90m: ");
@@ -553,212 +530,14 @@ void TimeLog(std::string calledby) {
     Serial.print(epoch_last_1d);
 } 
 
-void ProcessTemp(vector <string> outputData) {
-
-  std::vector<int>::iterator it;
-
-  // extract humidity data from ESP MQTT msg
-  it = std::find(outputData.begin(), outputData.end(), "humidity") 
-  if (it != outputData.end())   
-  {
-    std::vector<string> flds;
-    char * pch;
-    pch = strtok(it, ":")
-    while (pch != NULL)
-    {
-      flds.push_back(pch)
-      pch = strtok (NULL, ":")
-    }
-    humidity = atof (flds[1]);
-  }
-  else
-    cout << "Humidity value not found in message"
-
-  // extract temperature data from ESP MQTT msg
-  it = std::find(outputData.begin(), outputData.end(), "temp") 
-  if (it != outputData.end())   
-  {
-    std::vector<string> flds;
-    char * pch;
-    pch = strtok(it, ":")
-    while (pch != NULL)
-    {
-      flds.push_back(pch)
-      pch = strtok (NULL, ":")
-    }
-    temp_f = atof (flds[1]);
-  }
-  else
-    cout << "Temperature value not found in message"
-  
-  // extract heater data from ESP MQTT msg
-  it = std::find(outputData.begin(), outputData.end(), "heaterState") 
-  if (it != outputData.end())   
-  {
-    std::vector<string> flds;
-    char * pch;
-    pch = strtok(it, ":")
-    while (pch != NULL)
-    {
-      flds.push_back(pch)
-      pch = strtok (NULL, ":")
-    }
-    heaterState = atof (flds[1]);
-    if (heaterState > 50)
-      stateVariable = true;
-    else 
-      stateVariable = false;
-  }
-  else
-    cout << "Heater value not found in message"
-
-  // get the data supplied by the Pi for upload here - first get the current time and convert it to Amazon format
-  epoch = std::chrono::system_clock::now();
-  time_t awstime = epoch; 
-  sprintf(awstimestr, "%04d%02d%02d%02d%02d%02d", year(awstime), month(awstime), day(awstime), hour(awstime), minute(awstime), second(awstime));
-  uploadData.push_back("Date:" + awstimestr + ":N"); 
-
-  // now get the current PID output
-  updateOutput();
-  uploadData.push_back("pidOutput:" + pidOutput ":N");
-
-  //Push 20sec data to DyanmoDB
-  DynamoPlaceTemp(TABLE_20S, uploadData);
-  
-  //Store 20sec data in vectors
-  temp_f_20s.push_back(temp_f);
-  humidity_20s.push_back(humidity);
-  pid_20s.push_back(pidOutput);
-  heater_20s.push_back(heaterState);
-
-  TimeLog("After 20s data stored in vectors: ");
-
-  //Handling once NTP time has passed 5min
-  if (epoch_now - epoch_last_5m > 300) { 
-
-    Serial.print("TE 48, ");
-
-    //Averaging 20sec measurements and setting them to a 5min variable
-    double temp_f_inst_5m = accumulate( temp_f_20s.begin(), temp_f_20s.end(), 0.0)/temp_f_20s.size();
-    double humidity_inst_5m = accumulate( humidity_20s.begin(), humidity_20s.end(), 0.0)/humidity_20s.size(); 
-    double pid_inst_5m = accumulate( pid_20s.begin(), pid_20s.end(), 0.0)/pid_20s.size();
-    double heater_inst_5m = accumulate( heater_20s.begin(), heater_20s.end(), 0.0)/heater_20s.size();
-
-    //store 5min data in vectors
-    temp_f_5m.push_back(temp_f_inst_5m);
-    humidity_5m.push_back(humidity_inst_5m);
-    pid_5m.push_back(pid_inst_5m);
-    heater_5m.push_back(heater_inst_5m);
-
-    //Resetting 20sec vectors
-    temp_f_20s.swap(std::vector<double>());
-    humidity_20s.swap(std::vector<double>());
-    pid_20s.swap(std::vector<double>());
-    heater_20s.swap(std::vector<double>()); 
-
-	  //Writing values to RTC memory in case of crash
-	  RTCMemWrite();
-      
-	  Serial.print("TE 50, ");
-    
-      //Sending 5m avg measurements
-      if (!flagDontPushAvgTemp) {
-       	Serial.println("Pushing 5m average to DB:\t");
-        Serial.print(temp_f_inst_5m);
-        Serial.print(",");
-        Serial.print(humidity_inst_5m);
-        Serial.print(",");
-        Serial.println(counter_20s);
-            // print the hour, minute and second:
-        Serial.print((epoch  % 86400L) / 3600); // print the hour (86400 equals secs per day)
-        Serial.print(':');
-        if (((epoch % 3600) / 60) < 10) {
-          // In the first 10 minutes of each hour, we'll want a leading '0'
-          Serial.print('0');
-        }
-        Serial.print((epoch  % 3600) / 60); // print the minute (3600 equals secs per minute)
-        Serial.print(':');
-        if ((epoch % 60) < 10) {
-          // In the first 10 seconds of each minute, we'll want a leading '0'
-          Serial.print('0');
-        }
-        Serial.print(epoch % 60); // print the second
-        Serial.print(",Epoch Now");
-        Serial.print(",");
-        Serial.print(epoch_now);
-        Serial.print(",");
-        Serial.print("Epoch Last Day");
-        Serial.print(",");
-        Serial.print(epoch_last_1d);
-        Serial.print("Epoch Last 90m");
-        Serial.print(",");
-        Serial.print(epoch_last_90m);
-        Serial.print("Epoch Last 5m");
-        Serial.print(",");
-        Serial.print(epoch_last_5m);
-        Serial.print("Epoch Difference Now to Last 5m");
-        Serial.print(",");
-        Serial.print(epoch_now - epoch_last_5m);
-        Serial.println();
-	
-      Serial.print("TE 51, ");
-
-        PushTempToDynamoDB(temp_f_inst_5m, humidity_inst_5m, pid_inst_5m, heater_inst_5m, TABLE_NAME3, HASH_KEY_NAME3, HASH_KEY_VALUE3, RANGE_KEY_NAME3);
-  yield();
-	
-      Serial.print("TE 52, ");
-
-      }
-  }
-
-  if (epoch_now - epoch_last_90m > 5400) {
-
-      Serial.print("TE 53, ");
-      
-      //Averaging 90min measurements and setting them to a 90min variable
-      temp_f_inst_90m = temp_f_sum_5m / counter_5m;
-      humidity_inst_90m = humidity_sum_5m / counter_5m; 
-      pid_inst_90m = pid_sum_5m / counter_5m;
-      heater_inst_90m = heater_sum_5m / counter_5m;
-
-      //Resetting 5min sums
-      temp_f_sum_5m = 0;
-      humidity_sum_5m = 0;
-      pid_sum_5m = 0;
-      heater_sum_5m = 0;
-    
-      //Resetting 5min measurement instance counter
-      counter_5m = 0;
-
-      Serial.print("TE 54, ");
-      
-      flagDontPushAvgTemp = false;
-    
-      //Ticking over 90m time counter
-      epoch_last_90m = epoch_now;
-    
-      //Adding cumulatively the values of the 90min measurements
-      temp_f_sum_90m = temp_f_sum_90m + temp_f_inst_90m;
-      humidity_sum_90m = humidity_sum_90m + humidity_inst_90m;
-      pid_sum_90m = pid_sum_90m + pid_inst_90m;
-      heater_sum_90m = heater_sum_90m + heater_inst_90m;
-      
-      //Incrementing 90min measurement instance counter
-      counter_90m++;
-
-        //Writing values to RTC memory
-  RTCMemWrite();
-
-      Serial.print("TE 55, ");
-    
-      //Sending 90m avg measurements
-      if (!flagDontPushAvgTemp) {
-        Serial.println("Pushing 90m average to DB:\t");
+void OutputDataLog{
+Serial.println("Pushing 90m average to DB:\t");
         Serial.print(temp_f_inst_90m);
         Serial.print(",");
         Serial.print(humidity_inst_90m);
         Serial.print(",");
         Serial.println(counter_5m);
+        Serial.print size of the arrays 
             // print the hour, minute and second:
         Serial.print((epoch  % 86400L) / 3600); // print the hour (86400 equals secs per day)
         Serial.print(':');
@@ -790,119 +569,224 @@ void ProcessTemp(vector <string> outputData) {
         Serial.print(",");
         Serial.print(epoch_now - epoch_last_90m);
         Serial.println();
+}
 
-      Serial.print("TE 56, ");
+double extractDataNum(std::vector<string> extractData, std::string iden) {
+  std::vector<int>::iterator it;
+  it = std::find(extractData.begin(), extractData.end(), iden) 
+  if (it != extractData.end())   
+  {
+    std::vector<string> flds;
+    char * pch;
+    pch = strtok(it, ":")
+    while (pch != NULL)
+    {
+      flds.push_back(pch)
+      pch = strtok (NULL, ":")
+    }
+    double out = atof (flds[1]);
+    return out;
+  }
+  else
+  {
+    cout << iden + " value not found in message"
+    throw error here
+  }
+}
 
-        PushTempToDynamoDB(temp_f_inst_90m, humidity_inst_90m, pid_inst_90m, heater_inst_90m, TABLE_NAME4, HASH_KEY_NAME4, HASH_KEY_VALUE4, RANGE_KEY_NAME4);
-  yield();
+std::string extractDataStr(std::vector<string> extractData, std::string iden) {
+  std::vector<int>::iterator it;
+  it = std::find(extractData.begin(), extractData.end(), iden) 
+  if (it != extractData.end())   
+  {
+    std::vector<string> flds;
+    char * pch;
+    pch = strtok(it, ":")
+    while (pch != NULL)
+    {
+      flds.push_back(pch)
+      pch = strtok (NULL, ":")
+    }
+    string out = atof (flds[1]);
+    return out;
+  }
+  else
+  {
+    cout << iden + " value not found in message"
+    throw error here
+  }
+}
 
-      Serial.print("TE 57, ");
+class Thermostat {
+  //This stores the unique ID of the thermostat
+  std::string thermoId;
+  //This stores the immediate (20sec) values of the thermostat
+  double humidity, temp_f, heaterState, pidOutput;
+  //This keeps track of whether the heater is currently turned on or off (at higher intervals, tells average time on)
+  bool heaterbool;
 
-      }
-     
+  //Variables to keep track of current and past upload time (format is seconds since last unix epoch)
+  unsigned long epoch, epoch_initial, epoch_last_5m, epoch_last_90m, epoch_last_1d;
+
+  //This section of double vector matrices stores the current and running data for the data that will be outputted to DynamoDB 
+  std::vector< vector<double> > temp_f_vec(3), humidity_vec(3), pid_vec(3), heater_vec(3);
+
+  public:
+  Thermostat(std::string);
+  void ProcessTemp (std::vector<string>);
+  void ProcessAvgTemp (int);
+  double updateOutput (bool);
+
+};
+
+Thermostat::Thermostat (std::string identifier){
+  thermoId = identifier;
+}
+
+
+
+void Thermostat::ProcessTemp(std::vector<string> inputData) {
+
+  // Constants describing DynamoDB table and values being used
+  const static char* TABLE_NAMES[] = { "Temperatures_20_sec", "Temperatures_5_min", "Temperatures_90_min", "Temperatures_1_day" };
+
+  //Vector for 20s upload data
+  std::vector<string> output_20s(inputData);
+
+  // extract humidity data from ESP MQTT msg
+  humidity = extractDataNum(inputData, "humidity");
+
+  // extract temperature data from ESP MQTT msg
+  temp_f = extractDataNum(inputData, "temp");
+  
+  // extract heater data from ESP MQTT msg
+  heaterState = extractDataNum(inputData, "heaterState");
+  if (heaterState > 50 && heaterState < 110)
+    heaterbool = true;
+  else if (heaterState < 50 && heaterState > -10)
+    heaterbool = false;
+  else 
+    throw error here "invalid heater state from ESP"
+
+  //Get current time
+  epoch = std::chrono::system_clock::now();
+
+  //Set initial time values if they're empty (start of program) 
+  if (!epoch_initial) {
+  epoch_initial = epoch;
+  epoch_last_5m = epoch;
+  epoch_last_90m = epoch;
+  epoch_last_1d = epoch;
+  } 
+
+  if (!epoch_last_5m) {
+    //Just in case RTC memory loads a update time for 90m/1d that would be sooner than the 5m
+    epoch_last_5m = epoch;
   }
 
-    if (epoch_now - epoch_last_1d > 86400) {
-      
-      Serial.print("TE 58, ");
-      
-      //Averaging 1 day measurements and setting them to a 1 day variable
-      temp_f_inst_1d = temp_f_sum_90m / counter_90m;
-      humidity_inst_1d = humidity_sum_90m / counter_90m; 
-      pid_inst_1d = pid_sum_90m / counter_90m;
-      heater_inst_1d = heater_sum_90m / counter_90m;
+  // get the data supplied by the Pi for upload here - first get the current time and convert it to Amazon format
+  time_t awstime = epoch; 
+  string awstimestr;
+  sprintf(awstimestr, "%04d%02d%02d%02d%02d%02d", year(awstime), month(awstime), day(awstime), hour(awstime), minute(awstime), second(awstime));
+  output_20s.push_back("Date:" + awstimestr + ":N"); 
 
-      //Resetting 90min sums
-      temp_f_sum_90m = 0;
-      humidity_sum_90m = 0;
-      pid_sum_90m = 0;
-      heater_sum_90m = 0;
-    
-      //Resetting 90min measurement instance counter
-      counter_90m = 0;
-      
-      flagDontPushAvgTemp = false;
-    
-      //Ticking over 1d time counter
-      epoch_last_1d = epoch_now;
-    
-//      //Adding cumulatively the values of the 1 day measurements ( no need here)
-//      temp_f_sum_1d = temp_f_sum_1d + temp_f_inst_1d;
-//      humidity_sum_1d = humidity_sum_1d + humidity_inst_1d;
-//      pid_sum_1d = pid_sum_1d + pid_inst_1d;
-//      heater_sum_1d = heater_sum_1d + heater_inst_1d;
-      
-//      //Incrementing 1 day measurement instance counter ( no need here)
-//      1d_counter++;
+  // now get the current PID output
+  pidOutput = this->updateOutput(true);
+  output_20s.push_back("pidOutput:" + pidOutput ":N");
 
-        //Writing values to RTC memory
+  //Store 20sec data in vectors
+  temp_f_vec[0].push_back(temp_f);
+  humidity_vec[0].push_back(humidity);
+  pid_vec[0].push_back(pidOutput);
+  heater_vec[0].push_back(heaterState);
+
+  //Push 20sec data to DyanmoDB
+  DynamoPlaceTemp(TABLE_NAMES[0], output_20s);
+
+  //Resetting output vector
+  output_20s.swap(std::vector<string>());
+
+  TimeLog("After 20s data stored in vectors: ");
+
+  //Handling once time has passed beyond a new interval 
+  if (epoch - epoch_last_5m > 300){
+    this->ProcessAvgTemp(0);
+    epoch_last_5m = epoch;
+  } 
+
+  if (epoch - epoch_last_90m > 5400){
+    this->ProcessAvgTemp(1);
+    epoch_last_90m = epoch;
+  }
+    
+  if (epoch - epoch_last_1d > 86400){ 
+    this->ProcessAvgTemp(2);
+    epoch_last_1d = epoch;
+  }
+
+}
+
+void Thermostat::ProcessAvgTemp (int i) {
+
+  //Averaging input interval measurements and setting them to an output single variable
+  double t_i = accumulate( temp_f_vec[i].begin(), temp_f_vec[i].end(), 0.0)/temp_f_vec[i].size();
+  double hu_i = accumulate( humidity_vec[i].begin(), humidity_vec[i].end(), 0.0)/humidity_vec[i].size(); 
+  double p_i = accumulate( pid_vec[i].begin(), pid_vec[i].end(), 0.0)/pid_vec[i].size();
+  double he_i = accumulate( heater_vec[i].begin(), heater_vec[i].end(), 0.0)/heater_vec[i].size();
+
+  //Create vector for upload data and add Id
+  std::vector<string> outputvector;
+  outputvector.push_back("Id:" + Thermostat.thermoId + ":S");
+
+  //Upload time data
+  unsigned long epoch = std::chrono::system_clock::now(); 
+  time_t awstime = epoch; 
+  string awstimestr;
+  sprintf(awstimestr, "%04d%02d%02d%02d%02d%02d", year(awstime), month(awstime), day(awstime), hour(awstime), minute(awstime), second(awstime));
+  outputvector.push_back("Date:" + awstimestr + ":N"); 
+
+  //Convert other data to strings and add to output vector
+  char buffer[20];
+
+  snprintf(buffer, sizeof(buffer), "%.2f", t_i);
+  outputvector.push_back("temp:" + buffer + ":N")
+  buffer[0] = '\0';
+
+  snprintf(buffer, sizeof(buffer), "%.2f", hu_i);
+  outputvector.push_back("humidity:" + buffer + ":N")
+  buffer[0] = '\0';
+
+  snprintf(buffer, sizeof(buffer), "%.2f", p_i);
+  outputvector.push_back("pidOutput:" + buffer + ":N")
+  buffer[0] = '\0';
+
+  snprintf(buffer, sizeof(buffer), "%.2f", he_i);
+  outputvector.push_back("heaterState:" + buffer + ":N")
+  buffer[0] = '\0';
+
+  //If not dealing with the day long upload, then push average to output interval vector
+  if (i<2){
+    temp_f_vec[i+1].push_back(t_i);
+    humidity_vec[i+1].push_back(hu_i);
+    pid_vec[i+1].push_back(p_i);
+    heater_vec[i+1].push_back(he_i);
+  }
+
+  //Resetting input interval vectors
+  temp_f_vec[i].swap(std::vector<double>());
+  humidity_vec[i].swap(std::vector<double>());
+  pid_vec[i].swap(std::vector<double>());
+  heater_vec[i].swap(std::vector<double>()); 
+
+  //Writing values to RTC memory in case of crash, then log/debug output and time
   RTCMemWrite();
+  LogOutputData();
 
-      Serial.print("TE 59, ");
-    
-      //Sending 1d avg measurements
-      if (!flagDontPushAvgTemp) {
-         Serial.println("Pushing 1d average to DB:\t");
-        Serial.print(temp_f_inst_1d);
-        Serial.print(",");
-        Serial.print(humidity_inst_1d);
-        Serial.print(",");
-        Serial.println(counter_90m);
-            // print the hour, minute and second:
-        Serial.print((epoch  % 86400L) / 3600); // print the hour (86400 equals secs per day)
-        Serial.print(':');
-        if (((epoch % 3600) / 60) < 10) {
-          // In the first 10 minutes of each hour, we'll want a leading '0'
-          Serial.print('0');
-        }
-        Serial.print((epoch  % 3600) / 60); // print the minute (3600 equals secs per minute)
-        Serial.print(':');
-        if ((epoch % 60) < 10) {
-          // In the first 10 seconds of each minute, we'll want a leading '0'
-          Serial.print('0');
-        }
-        Serial.print(epoch % 60); // print the second
-        Serial.print(",Epoch Now");
-        Serial.print(",");
-        Serial.print(epoch_now);
-        Serial.print(",");
-        Serial.print("Epoch Last Day");
-        Serial.print(",");
-        Serial.print(epoch_last_1d);
-        Serial.print("Epoch Last 90m");
-        Serial.print(",");
-        Serial.print(epoch_last_90m);
-        Serial.print("Epoch Last 5m");
-        Serial.print(",");
-        Serial.print(epoch_last_5m);
-        Serial.print("Epoch Difference Now to Last 90m");
-        Serial.print(",");
-        Serial.print(epoch_now - epoch_last_90m);
-        Serial.println();
+  //Push data to DyanmoDB
+  DynamoPlaceTemp(TABLE_NAMES[i+1], outputvector);
 
-      Serial.print("TE 60, ");
-
-        PushTempToDynamoDB(temp_f_inst_1d, humidity_inst_1d, pid_inst_1d, heater_inst_1d, TABLE_NAME5, HASH_KEY_NAME5, HASH_KEY_VALUE5, RANGE_KEY_NAME5);
-  yield();
-
-      Serial.print("TE 61, ");
-
-      }
-
-  }
-
-//Currently not using the counter overflow watchdog - NTP time checking seems to be sufficient 
-//  if ((counter_20s > 20) || (counter_5m > 20) || (counter_90m > 20)) {
-//    Serial.println("Too many measurements for time period!");
-//    Serial.println("20sec measurements (per 5 min) now stored: ");
-//    Serial.println(counter_20s);
-//    Serial.println("5m measurements (per 90 min) now stored: ");
-//    Serial.println(counter_5m);
-//    Serial.println("90m measurements (per 1 day) now stored: ");
-//    Serial.println(counter_90m);
-//    flagDontPushAvgTemp = true;
-//    Serial.println("Halting publish of avg measurements to DynamoDB tables");
-//  }
+  //Resetting output vector
+  outputvector.swap(std::vector<string>());
 
 }
 
@@ -1142,45 +1026,68 @@ void RTCMemWrite() {
   
 }
 
-void updateOutput() {
-  unsigned long now2 = millis();
-
-  //Don't compute the PID output if temp is invalid (will give an overflow as the PID output)
-  if (!isnan(temp_f)) {
-    myPID.Compute();
-  }
-
+double Thermostat::updateOutput(bool set_compute_flag) {
+  
+  //Variables to keep track of current time (format is seconds since last unix epoch)
+  static unsigned long epoch;
+  epoch = std::chrono::system_clock::now();
+  //Variables to keep track of PID window
+  static unsigned long windowStartTime = 0;
+  const static unsigned long windowSize = 1800; // 30 minutes (ish)
   //Set initial window start time on initial run
   if (windowStartTime = 0)
     windowStartTime = epoch;
-  
   //Shift the window once past 30min
   if (difftime(epoch, windowStartTime) > windowSize) {
     windowStartTime += windowSize;
   }
 
+  //PID tuning variables 
+  const static double KP = 25;
+  const static double KI = 0.028;
+  const static double KD = 0;   // Not yet used
+  //PID output variable
+  static double pidCompute;
+  static double temp_input = temp_f;
+  //Setpoint hardcoded, will switch to a GetItem from DynamoDB in the future
+  static double setPoint = 69.0;
+  //PID variable initial setting
+  const static PID myPID(&temp_input, &pidCompute, &setPoint, KP, KI, KD, DIRECT);
+
+  //If only a setpoint update, don't step into the set loop - commented out for now, will see if fiddling with setpoint harms program
+  // if (!set_compute_flag)
+  //   return pidCompute;
+
+  //Don't compute the PID output if temp is invalid (will give an overflow as the PID output)
+  if (temp_f < 100 && temp_f > 0) {
+    myPID.Compute();
+  }
+
   //Heater control updates based on setting state and PID output - you can see at the start that this was based on the RF switch/outlet system, given the 'Outlet' helper function names
-  if ((HeaterControl == 1) && (stateVariable))
+  if ((HeaterControl == 1) && (heaterbool))
   {
     Serial.println("Manual Control set to Off & Heater is On - Turning it Off");
     OffOutlet();
   }
-  else if ((HeaterControl == 3) && (!stateVariable))
+  else if ((HeaterControl == 3) && (!heaterbool))
   {
     Serial.println("Manual Control set to On & Heater is Off - Turning it On");
     OnOutlet();
   }
   //I need to investigate whether the thermostat will turn the heater back on during a cycle that it has already turned it off within - ideally, the heater should only come on at the beginning of the window - I could set an additional 'HasTurnedOff' bool if need be to fix this if it's an issue
-  else if ((HeaterControl == 2) && (pidOutput * windowSize > ((epoch - windowStartTime) * 100)) && (!stateVariable))
+  else if ((HeaterControl == 2) && (pidOutput * windowSize > ((epoch - windowStartTime) * 100)) && (!heaterbool))
   {
     Serial.println("Automatic Control - Turning On");
     OnOutlet();
   }
-  else if ((HeaterControl == 2) && (pidOutput * windowSize < ((epoch - windowStartTime) * 100)) && (stateVariable))
+  else if ((HeaterControl == 2) && (pidOutput * windowSize < ((epoch - windowStartTime) * 100)) && (heaterbool))
   {
     Serial.println("Automatic Control - Turning Off");
     OffOutlet();
   }
+
+  return pidCompute;
+
 }
 
 
@@ -1205,7 +1112,6 @@ void OnOutlet() {
   delay(500);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.println("Turning On Heater!");
-  stateVariable = true;
   //Currently not using the RF switch functionality
   //  mySwitch.send("000101010001110100000011");
   //  delay(500);
@@ -1238,7 +1144,6 @@ void OffOutlet() {
   delay(500);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.println("Turning Off Heater!"); //
-  stateVariable = false;
   //Currently not using the RF switch functionality
   //  digitalWrite(LED_BUILTIN, LOW);
   //  mySwitch.send("000101010001110100001100");
